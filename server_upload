@@ -1,26 +1,20 @@
-#include <winsock2.h>
 #include <iostream>
 #include <fstream>
+#include <boost/asio.hpp>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <iphlpapi.h>
 #include <sstream>
-#include <iphlpapi.h>  // Para obter o MAC Address
-#include <iomanip>     // Para formatar o MAC Address
+#include <iomanip>
 
-#pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 
-#define BUFFER_SIZE 4096
+using boost::asio::ip::tcp;
+constexpr int PORT = 12345;
 
-// Função para verificar erros nas chamadas de socket
-void checkError(int result, const char* errorMessage) {
-    if (result == SOCKET_ERROR) {
-        std::cerr << errorMessage << " com código de erro: " << WSAGetLastError() << std::endl;
-        WSACleanup();
-        exit(1);
-    }
-}
-
-// Função para obter o MAC address da máquina
-std::string getMACAddress() {
+// Função para obter o MAC address da interface conectada à internet
+std::string getMACAddressFromConnectedInterface() {
     IP_ADAPTER_INFO AdapterInfo[16];
     DWORD dwBufLen = sizeof(AdapterInfo);
     DWORD dwStatus = GetAdaptersInfo(AdapterInfo, &dwBufLen);
@@ -31,80 +25,83 @@ std::string getMACAddress() {
     }
 
     PIP_ADAPTER_INFO pAdapterInfo = AdapterInfo;
-    std::ostringstream macStream;
-    for (int i = 0; i < pAdapterInfo->AddressLength; ++i) {
-        if (i != 0) macStream << "-";
-        macStream << std::hex << std::setw(2) << std::setfill('0') << (int)pAdapterInfo->Address[i];
+    while (pAdapterInfo) {
+        if (pAdapterInfo->IpAddressList.IpAddress.String[0] != '0') {
+            std::ostringstream macStream;
+            for (int i = 0; i < pAdapterInfo->AddressLength; ++i) {
+                if (i != 0) macStream << "-";
+                macStream << std::hex << std::setw(2) << std::setfill('0') << (int)pAdapterInfo->Address[i];
+            }
+            return macStream.str();
+        }
+        pAdapterInfo = pAdapterInfo->Next;
     }
-    return macStream.str();
+
+    std::cerr << "Nenhuma interface conectada à internet foi encontrada." << std::endl;
+    return "";
 }
 
-// Função para gerar um UUID simples baseado no MAC address
+// Função para gerar UUID baseado no MAC address
 std::string generateUUIDFromMAC() {
-    std::string macAddress = getMACAddress();
-    std::string uuid = macAddress + "-UUID";
-    return uuid;
+    std::string macAddress = getMACAddressFromConnectedInterface();
+    if (!macAddress.empty()) {
+        boost::uuids::name_generator gen(boost::uuids::string_generator()(macAddress));
+        boost::uuids::uuid uuid = gen(macAddress);
+        return to_string(uuid);
+    }
+    return "";
 }
 
 int main() {
-    WSADATA wsaData;
-    checkError(WSAStartup(MAKEWORD(2, 2), &wsaData), "Falha ao iniciar Winsock");
+    try {
+        boost::asio::io_service io_service;
+        tcp::acceptor acceptor(io_service, tcp::endpoint(tcp::v4(), PORT));
 
-    SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    checkError((serverSocket == INVALID_SOCKET) ? SOCKET_ERROR : 0, "Falha ao criar o socket do servidor");
+        std::cout << "Aguardando conexão na porta " << PORT << "...\n";
+        
+        // Geração do UUID baseado no MAC address do servidor
+        std::string serverUUID = generateUUIDFromMAC();
+        if (!serverUUID.empty()) {
+            std::cout << "UUID do servidor: " << serverUUID << std::endl;
+        } else {
+            std::cerr << "Falha ao gerar o UUID do servidor!" << std::endl;
+            return 1;
+        }
 
-    sockaddr_in serverAddr;
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(54000);
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
+        for (;;) {
+            tcp::socket socket(io_service);
+            acceptor.accept(socket);
+            std::cout << "Cliente conectado." << std::endl;
 
-    checkError(bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)), "Falha ao realizar bind no servidor");
-    checkError(listen(serverSocket, SOMAXCONN), "Falha ao colocar o servidor em modo de escuta");
+            // Recebendo o nome do arquivo
+            char filename[256];
+            boost::asio::read(socket, boost::asio::buffer(filename, sizeof(filename)));
+            std::cout << "Recebendo arquivo: " << filename << std::endl;
 
-    std::cout << "Servidor aguardando conexão..." << std::endl;
+            // Recebendo o arquivo
+            std::ofstream outfile(filename, std::ios::binary);
+            if (!outfile) {
+                std::cerr << "Erro ao abrir o arquivo para escrita!" << std::endl;
+                return 1;
+            }
 
-    SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
-    checkError((clientSocket == INVALID_SOCKET) ? SOCKET_ERROR : 0, "Falha ao aceitar conexão do cliente");
+            char data[1024];
+            boost::system::error_code error;
+            while (size_t len = socket.read_some(boost::asio::buffer(data), error)) {
+                outfile.write(data, len);
+                if (error == boost::asio::error::eof) {
+                    break;
+                } else if (error) {
+                    throw boost::system::system_error(error);
+                }
+            }
 
-    // Geração e envio do UUID para o cliente
-    std::string uuid = generateUUIDFromMAC();
-    send(clientSocket, uuid.c_str(), uuid.size(), 0);
-    std::cout << "UUID enviado para o cliente: " << uuid << std::endl;
-
-    char buffer[BUFFER_SIZE];
-
-    // Receber o nome do arquivo
-    int fileNameSize = recv(clientSocket, buffer, BUFFER_SIZE, 0);
-    checkError(fileNameSize, "Erro ao receber o nome do arquivo");
-
-    buffer[fileNameSize] = '\0';
-    std::string fileName(buffer);
-
-    std::ofstream outputFile(fileName, std::ios::binary);
-
-    if (!outputFile.is_open()) {
-        std::cerr << "Falha ao criar o arquivo para salvar os dados." << std::endl;
-        closesocket(clientSocket);
-        closesocket(serverSocket);
-        WSACleanup();
-        return 1;
+            outfile.close();
+            std::cout << "Arquivo recebido com sucesso." << std::endl;
+        }
+    } catch (std::exception& e) {
+        std::cerr << "Erro: " << e.what() << std::endl;
     }
-
-    int bytesReceived;
-    while ((bytesReceived = recv(clientSocket, buffer, BUFFER_SIZE, 0)) > 0) {
-        outputFile.write(buffer, bytesReceived);
-    }
-
-    if (bytesReceived == 0) {
-        std::cout << "Upload concluído." << std::endl;
-    } else {
-        std::cerr << "Erro ao receber dados." << std::endl;
-    }
-
-    outputFile.close();
-    closesocket(clientSocket);
-    closesocket(serverSocket);
-    WSACleanup();
 
     return 0;
 }
