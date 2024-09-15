@@ -1,0 +1,77 @@
+#include <winsock2.h>
+#include <iostream>
+#include <fstream>
+
+#pragma comment(lib, "ws2_32.lib")
+
+#define BUFFER_SIZE 4096
+
+void checkError(int result, const char* errorMessage) {
+    if (result == SOCKET_ERROR) {
+        std::cerr << errorMessage << " com código de erro: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        exit(1);
+    }
+}
+
+int main() {
+    WSADATA wsaData;
+    checkError(WSAStartup(MAKEWORD(2, 2), &wsaData), "Falha ao iniciar Winsock");
+
+    SOCKET clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+    checkError((clientSocket == INVALID_SOCKET) ? SOCKET_ERROR : 0, "Falha ao criar o socket do cliente");
+
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(54000);
+    inet_pton(AF_INET, "192.168.1.100", &serverAddr.sin_addr); // IP do servidor
+
+    checkError(connect(clientSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)), "Falha ao conectar ao servidor");
+
+    // Receber o UUID do servidor
+    char uuidBuffer[BUFFER_SIZE];
+    int uuidSize = recv(clientSocket, uuidBuffer, BUFFER_SIZE, 0);
+    checkError(uuidSize, "Erro ao receber UUID do servidor");
+    uuidBuffer[uuidSize] = '\0';
+
+    std::string receivedUUID(uuidBuffer);
+    std::cout << "UUID recebido do servidor: " << receivedUUID << std::endl;
+
+    // Verificar o UUID (opcionalmente, você pode validar esse UUID conforme a lógica do seu sistema)
+    if (receivedUUID.empty()) {
+        std::cerr << "UUID inválido recebido. Conexão encerrada." << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    // Especificar o arquivo para upload
+    std::string fileName = "arquivo_para_enviar.txt";
+    std::ifstream file(fileName, std::ios::binary);
+
+    if (!file.is_open()) {
+        std::cerr << "Falha ao abrir o arquivo." << std::endl;
+        closesocket(clientSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    // Enviar o nome do arquivo
+    send(clientSocket, fileName.c_str(), fileName.size(), 0);
+
+    char buffer[BUFFER_SIZE];
+    while (file.read(buffer, sizeof(buffer))) {
+        send(clientSocket, buffer, sizeof(buffer), 0);
+    }
+
+    // Enviar qualquer resto do arquivo
+    send(clientSocket, buffer, file.gcount(), 0);
+
+    file.close();
+    closesocket(clientSocket);
+    WSACleanup();
+
+    std::cout << "Upload concluído." << std::endl;
+
+    return 0;
+}
